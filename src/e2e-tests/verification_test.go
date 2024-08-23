@@ -45,6 +45,7 @@ var _ = Describe("Feature Verification", Ordered, Label("verification"), func() 
 			bosh.Operation(`test/tune-mysql-config.yml`),
 			bosh.Operation(`test/with-wildcard-schema-access.yml`),
 			bosh.Operation(`test/with-syslog.yml`),
+			bosh.Operation(`test/optimize-vm-swappiness.yml`),
 			bosh.Operation(`enable-jemalloc.yml`),
 			bosh.Var(`innodb_buffer_pool_size_percent`, `14`),
 			bosh.Var(`binlog_space_percent`, `20`),
@@ -68,7 +69,52 @@ var _ = Describe("Feature Verification", Ordered, Label("verification"), func() 
 		Expect(bosh.DeleteDeployment(deploymentName)).To(Succeed())
 	})
 
+	Context("OS configuration", Label("os_config"), func() {
+		It("configures vm.swappiness = 1", func() {
+			swappinessValues, err := bosh.RemoteCommand(deploymentName, "mysql", "cat /proc/sys/vm/swappiness")
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(strings.Fields(swappinessValues)).To(ConsistOf("1", "1", "1"),
+				`Expected vm.swappiness to be 1 on all mysql nodes, but it was not!`)
+
+			sysctlOutput, err := bosh.RemoteCommand(deploymentName, "mysql/0", `sudo sysctl --load /etc/sysctl.d/70-mysql-swappiness.conf 2>&1`)
+			Expect(err).NotTo(HaveOccurred(), "Expected sysctl to be able to read /etc/sysctl.d/70-mysql-swappiness.conf, but it failed!\noutput = %s", sysctlOutput)
+			Expect(sysctlOutput).To(ContainSubstring(`vm.swappiness = 1`),
+				"Expected vm.swappiness to be 1, but it was not!\nCommand output: %s", sysctlOutput)
+		})
+	})
+
 	Context("MySQL Configuration", Label("configuration"), func() {
+		It("sets the default sync_binlog value", Label("sync_binlog"), func() {
+			instances, err := bosh.Instances(deploymentName, bosh.MatchByInstanceGroup("mysql"))
+			Expect(err).NotTo(HaveOccurred())
+			for _, i := range instances {
+				db, err := sql.Open("mysql", "test-admin:integration-tests@tcp("+i.IP+")/?tls=skip-verify&interpolateParams=true")
+				Expect(err).NotTo(HaveOccurred())
+
+				var syncBinlog string
+				Expect(db.QueryRow("SELECT @@global.sync_binlog").Scan(&syncBinlog)).
+					To(Succeed())
+				Expect(syncBinlog).To(Equal(`1`))
+				Expect(db.Close()).To(Succeed())
+			}
+		})
+
+		It("sets the expected innodb_flush_method", Label("innodb_flush_method"), func() {
+			instances, err := bosh.Instances(deploymentName, bosh.MatchByInstanceGroup("mysql"))
+			Expect(err).NotTo(HaveOccurred())
+			for _, i := range instances {
+				db, err := sql.Open("mysql", "test-admin:integration-tests@tcp("+i.IP+")/?tls=skip-verify&interpolateParams=true")
+				Expect(err).NotTo(HaveOccurred())
+
+				var innodbFlushMethod string
+				Expect(db.QueryRow("SELECT @@global.innodb_flush_method").Scan(&innodbFlushMethod)).
+					To(Succeed())
+				Expect(innodbFlushMethod).To(Equal(`fsync`))
+				Expect(db.Close()).To(Succeed())
+			}
+		})
+
 		It("initializes a cluster with an empty gtid_executed", func() {
 			instances, err := bosh.Instances(deploymentName, bosh.MatchByInstanceGroup("mysql"))
 			Expect(err).NotTo(HaveOccurred())
@@ -170,6 +216,16 @@ var _ = Describe("Feature Verification", Ordered, Label("verification"), func() 
 				Error().NotTo(HaveOccurred())
 			Expect(db.QueryRow(`SELECT data FROM multi_db2.t1 WHERE id = 1`).Scan(&storedValue)).To(Succeed())
 			Expect(storedValue).To(Equal(userValue))
+		})
+
+		It("sets expected default values for selected properties", func() { // Ensure these values change on later redeployment test
+			var maxAllowedPacket string
+			Expect(db.QueryRow(`SELECT @@global.max_allowed_packet`).Scan(&maxAllowedPacket)).To(Succeed())
+			Expect(maxAllowedPacket).To(Equal("268435456"), "max_allowed_packet value is not at expected 256M default value")
+
+			var idbParallelThreads string
+			Expect(db.QueryRow(`SELECT @@global.innodb_compression_level`).Scan(&idbParallelThreads)).To(Succeed())
+			Expect(idbParallelThreads).To(Equal("6"), "innodb_compression_level value is not at expected 6 default value")
 		})
 	})
 
@@ -744,13 +800,55 @@ var _ = Describe("Feature Verification", Ordered, Label("verification"), func() 
 		})
 	})
 
-	When("jemalloc profiling is enabled", Label("jemalloc", "profiling"), func() {
+	When("redeploying with additional feature flags", func() {
 		BeforeAll(func() {
 			if expectedMysqlVersion != "8.0" {
 				Skip("MYSQL_VERSION(" + expectedMysqlVersion + ") != 8.0. Skipping Percona v8.0+ jemalloc profiling feature test.")
 			}
 
-			Expect(bosh.RedeployPXC(deploymentName, bosh.Operation("enable-jemalloc-profiling.yml"))).To(Succeed())
+			By("enabling jemalloc profiling")
+			By("enabling O_DIRECT")
+			By("disabling sync_binlog")
+			By("applying additional my.cnf entries")
+
+			Expect(bosh.RedeployPXC(deploymentName,
+				bosh.Operation("enable-jemalloc-profiling.yml"),
+				bosh.Operation(`set-innodb-flush-method.yml`),
+				bosh.Var(`innodb_flush_method`, `O_DIRECT`),
+				bosh.Operation(`set-sync-binlog.yml`),
+				bosh.Var(`sync_binlog`, `0`),
+				bosh.Operation("test/additional-mycnf-entries.yml"),
+			)).To(Succeed())
+		})
+
+		It("sets the explicitly configured sync_binlog value", Label("sync_binlog"), func() {
+			instances, err := bosh.Instances(deploymentName, bosh.MatchByInstanceGroup("mysql"))
+			Expect(err).NotTo(HaveOccurred())
+			for _, i := range instances {
+				db, err := sql.Open("mysql", "test-admin:integration-tests@tcp("+i.IP+")/?tls=skip-verify&interpolateParams=true")
+				Expect(err).NotTo(HaveOccurred())
+
+				var syncBinlog string
+				Expect(db.QueryRow("SELECT @@global.sync_binlog").Scan(&syncBinlog)).
+					To(Succeed())
+				Expect(syncBinlog).To(Equal(`0`))
+				Expect(db.Close()).To(Succeed())
+			}
+		})
+
+		It("sets the expected innodb_flush_method", Label("innodb_flush_method"), func() {
+			instances, err := bosh.Instances(deploymentName, bosh.MatchByInstanceGroup("mysql"))
+			Expect(err).NotTo(HaveOccurred())
+			for _, i := range instances {
+				db, err := sql.Open("mysql", "test-admin:integration-tests@tcp("+i.IP+")/?tls=skip-verify&interpolateParams=true")
+				Expect(err).NotTo(HaveOccurred())
+
+				var innodbFlushMethod string
+				Expect(db.QueryRow("SELECT @@global.innodb_flush_method").Scan(&innodbFlushMethod)).
+					To(Succeed())
+				Expect(innodbFlushMethod).To(Equal(`O_DIRECT`))
+				Expect(db.Close()).To(Succeed())
+			}
 		})
 
 		It("does not write memory profiles by default", func() {
@@ -759,7 +857,7 @@ var _ = Describe("Feature Verification", Ordered, Label("verification"), func() 
 			Expect(out).To(Equal("-"), `Expected no memory profiles to be found in /var/vcap/data/pxc-mysql/tmp/`)
 		})
 
-		It("enables access to jemalloc memory profile when adminstrative commands are run", func() {
+		It("enables access to jemalloc memory profile when administrative commands are run", func() {
 			By("writing profile files to the ephemeral disk after FLUSH MEMORY PROFILE is run")
 			Expect(db.Exec(`FLUSH MEMORY PROFILE`)).Error().NotTo(HaveOccurred())
 
@@ -775,6 +873,26 @@ var _ = Describe("Feature Verification", Ordered, Label("verification"), func() 
 				mysqlNode, "sudo /var/vcap/packages/jemalloc/bin/jeprof --show_bytes --text /var/vcap/packages/percona-xtradb-cluster-8.0/bin/mysqld "+out)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(out).To(MatchRegexp(`Total: \d+ B`))
+		})
+
+		Context("dynamically injecting my.cnf entries", func() {
+			It("sets a net new property within an existing section", func() {
+				var idbParallelThreads string
+				Expect(db.QueryRow(`SELECT @@global.innodb_compression_level`).Scan(&idbParallelThreads)).To(Succeed())
+				Expect(idbParallelThreads).To(Equal("0"), "dynamic my.cnf failed to configure mysql with the expected innodb_compression_level")
+			})
+			It("overrides the value of an existing property (max_allowed_packet)", func() {
+				var maxAllowedPacket string
+				Expect(db.QueryRow(`SELECT @@global.max_allowed_packet`).Scan(&maxAllowedPacket)).To(Succeed())
+				Expect(maxAllowedPacket).To(Equal("1073741824"), "dynamic my.cnf failed to configure mysql with the expected max_allowed_packet parameter")
+			})
+			It("creates a net new section with properties consumable by mysql processes", func() {
+				xtrabackupPath := "/var/vcap/packages/percona-xtrabackup-" + expectedMysqlVersion + "/bin/"
+				xtrabackupOptions, err := bosh.RemoteCommand(deploymentName, "mysql/0", "sudo "+
+					xtrabackupPath+"xtrabackup --defaults-file=/var/vcap/jobs/pxc-mysql/config/my.cnf --help --verbose | grep target")
+				Expect(err).NotTo(HaveOccurred()) // note "xtrabackup --help ..." returns 1
+				Expect(xtrabackupOptions).To(MatchRegexp(`target-dir\s*\/var\/vcap\/store\/custom-backup-dir\/`), "dynamic my.cnf failed to configure xtrabackup with the expected target-dir parameter")
+			})
 		})
 	})
 })

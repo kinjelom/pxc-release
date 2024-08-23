@@ -34,6 +34,7 @@ var _ = Describe("Sidecar API", func() {
 		ts               *httptest.Server
 
 		ExpectedStateSnapshot domain.DBState
+		testLogger            *lagertest.TestLogger
 	)
 
 	BeforeEach(func() {
@@ -53,7 +54,7 @@ var _ = Describe("Sidecar API", func() {
 		stateSnapshotter = new(apifakes.FakeStateSnapshotter)
 		stateSnapshotter.StateReturns(ExpectedStateSnapshot, nil)
 
-		testLogger := lagertest.NewTestLogger("mysql_cmd")
+		testLogger = lagertest.NewTestLogger("mysql_cmd")
 
 		testConfig := &config.Config{
 			SidecarEndpoint: config.SidecarEndpointConfig{
@@ -290,6 +291,81 @@ var _ = Describe("Sidecar API", func() {
 					Expect(state.WsrepLocalStateComment).To(Equal(string(returnedState.WsrepLocalState.Comment())))
 					Expect(state.Healthy).To(BeTrue())
 				})
+
+				It("logs the initial transition to its healthy state", func() {
+					req := createReq("api/v1/status", "GET")
+					resp, err := http.DefaultClient.Do(req)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(resp.StatusCode).To(Equal(http.StatusOK))
+
+					logData := testLogger.Logs()[0]
+					Expect(logData.Message).To(Equal("mysql_cmd.health transition response: api.V1StatusResponse{WsrepLocalState:0x4, WsrepLocalStateComment:\"Synced\", WsrepLocalIndex:0x1, Healthy:true} maintenanceEnabled: false readOnly: true"))
+				})
+
+				When("a healthy node becomes & stays unhealthy", func() {
+					BeforeEach(func() {
+						stateSnapshotter.StateReturnsOnCall(0, domain.DBState{
+							WsrepLocalIndex:    uint(2),
+							WsrepLocalState:    domain.Synced,
+							ReadOnly:           false,
+							MaintenanceEnabled: false,
+						}, nil)
+						for i := 1; i <= 3; i++ {
+							stateSnapshotter.StateReturnsOnCall(i, domain.DBState{
+								WsrepLocalIndex:    uint(2),
+								WsrepLocalState:    domain.Synced,
+								ReadOnly:           false,
+								MaintenanceEnabled: true, // trigger unhealthy state
+							}, nil)
+						}
+					})
+
+					It("logs a single transition to the unhealthy status", func() {
+						req := createReq("api/v1/status", "GET")
+						for i := 1; i <= 4; i++ {
+							_, err := http.DefaultClient.Do(req)
+							Expect(err).ToNot(HaveOccurred())
+						}
+
+						Expect(stateSnapshotter.StateCallCount()).To(Equal(4))
+						Expect(len(testLogger.Logs())).To(Equal(2))
+						logData := testLogger.Logs()[0] // initial "healthy" status
+						Expect(logData.Message).To(Equal("mysql_cmd.health transition response: api.V1StatusResponse{WsrepLocalState:0x4, WsrepLocalStateComment:\"Synced\", WsrepLocalIndex:0x2, Healthy:true} maintenanceEnabled: false readOnly: false"))
+						logData = testLogger.Logs()[1] // single "unhealthy" status
+						Expect(logData.Message).To(Equal("mysql_cmd.health transition response: api.V1StatusResponse{WsrepLocalState:0x4, WsrepLocalStateComment:\"Synced\", WsrepLocalIndex:0x2, Healthy:false} maintenanceEnabled: true readOnly: false"))
+					})
+				})
+				When("an unhealthy node becomes & stays healthy", func() {
+					BeforeEach(func() {
+						stateSnapshotter.StateReturnsOnCall(0, domain.DBState{
+							WsrepLocalIndex:    uint(2),
+							WsrepLocalState:    domain.Synced,
+							ReadOnly:           false,
+							MaintenanceEnabled: true, // triggers unhealthy state
+						}, nil)
+						for i := 1; i <= 3; i++ {
+							stateSnapshotter.StateReturnsOnCall(i, domain.DBState{
+								WsrepLocalIndex:    uint(2),
+								WsrepLocalState:    domain.Synced,
+								ReadOnly:           false,
+								MaintenanceEnabled: false,
+							}, nil)
+						}
+					})
+
+					It("logs a single transition to the healthy status", func() {
+						req := createReq("api/v1/status", "GET")
+						for i := 1; i <= 4; i++ {
+							_, err := http.DefaultClient.Do(req)
+							Expect(err).ToNot(HaveOccurred())
+						}
+
+						Expect(stateSnapshotter.StateCallCount()).To(Equal(4))
+						Expect(len(testLogger.Logs())).To(Equal(1))
+						logData := testLogger.Logs()[0]
+						Expect(logData.Message).To(Equal("mysql_cmd.health transition response: api.V1StatusResponse{WsrepLocalState:0x4, WsrepLocalStateComment:\"Synced\", WsrepLocalIndex:0x2, Healthy:true} maintenanceEnabled: false readOnly: false"))
+					})
+				})
 			})
 
 			Context("when getting the state fails", func() {
@@ -303,6 +379,16 @@ var _ = Describe("Sidecar API", func() {
 					Expect(err).ToNot(HaveOccurred())
 
 					Expect(resp.StatusCode).To(Equal(http.StatusInternalServerError))
+				})
+
+				It("logs the error", func() {
+					req := createReq("api/v1/status", "GET")
+					_, err := http.DefaultClient.Do(req)
+					Expect(err).ToNot(HaveOccurred())
+
+					Expect(len(testLogger.Logs())).To(Equal(1))
+					logData := testLogger.Logs()[0]
+					Expect(logData.Data["error"]).To(Equal("possibly not a galera cluster"))
 				})
 			})
 		})

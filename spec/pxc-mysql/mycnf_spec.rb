@@ -337,4 +337,96 @@ describe 'my.cnf template' do
     end
   end
 
+  context 'when no explicit innodb_flush_method is set' do
+    it 'defaults innodb_flush_method to fsync' do
+      expect(rendered_template).to match("innodb_flush_method\s+= fsync")
+    end
+  end
+
+  context 'when an explicit innodb_flush_method is set' do
+    let(:spec) { { "engine_config" => { "innodb_flush_method" => "O_DIRECT"} } }
+    it 'configures that innodb_flush_method' do
+      expect(rendered_template).to match("innodb_flush_method\s+= O_DIRECT")
+    end
+  end
+
+  context 'when an invalid innodb_flush_method is set' do
+    let(:spec) { { "engine_config" => { "innodb_flush_method" => "INVALID"} } }
+    it 'throws an exception' do
+      expect { template.render(spec, consumes: links) }.to raise_error(RuntimeError, "Only innodb_flush_method=O_DIRECT or fsync or unset are supported!")
+    end
+  end
+
+  context 'when config provides additional mysql "raw entry" properties' do
+
+    let(:spec) { {
+      "engine_config" => {
+        "additional_raw_entries" => {
+          "mysql" => {
+            "early-plugin-load" => "arbitrary-plugin-name",
+            "arbitrary-mysql-param" => "arbitrary-mysql-param-value"
+          },
+          "client" => {
+            "additional-client-property" => "additional-client-value"
+          },
+          "mysql-8.0" => {
+            "additional-mysql-8.0-property" => "additional-mysql-8.0-value"
+          },
+          "mysql-5.7" => {
+            "additional-mysql-5.7-property" => "additional-mysql-5.7-value"
+          },
+          "mysqld" => {
+            "additional-mysqld-property" => "additional-mysqld-value"
+          },
+          "mysqld_plugin" => {
+            "additional-mysqld_plugin-property" => "additional-mysqld_plugin-value"
+          },
+          "sst" => {
+            "additional-sst-property" => "additional-sst-value"
+          },
+          "mysqldump" => {
+            "additional-mysqldump-property" => "additional-mysqldump-value"
+          },
+          "new_section" => {
+            "new_section-property" => "new_section-value"
+          }
+        }
+      }
+    } }
+
+    it 'adds the additional entries to my.cnf as expected' do
+      expect(parsed_mycnf).to include("mysql" => hash_including("early-plugin-load" => "arbitrary-plugin-name"))
+      expect(parsed_mycnf).to include("mysql" => hash_including("arbitrary-mysql-param" => "arbitrary-mysql-param-value"))
+    end
+    it 'does not effect existing my.cnf contents' do
+      expect(parsed_mycnf).to include("mysql" => hash_including("max_allowed_packet" => "256M"))
+    end
+
+    it 'adds additional provided client properties' do
+      expect(parsed_mycnf).to include("client" => hash_including("additional-client-property" => "additional-client-value"))
+    end
+    it 'adds additional provided mysql-8.0 properties' do
+      expect(parsed_mycnf).to include("mysql-8.0" => hash_including("additional-mysql-8.0-property" => "additional-mysql-8.0-value"))
+    end
+    it 'adds additional provided mysql-5.7 properties' do
+      expect(parsed_mycnf).to include("mysql-5.7" => hash_including("additional-mysql-5.7-property" => "additional-mysql-5.7-value"))
+    end
+    it 'adds additional provided mysqld properties' do
+      expect(parsed_mycnf).to include("mysqld" => hash_including("additional-mysqld-property" => "additional-mysqld-value"))
+    end
+    it 'adds additional provided mysqld_plugin properties' do
+      expect(parsed_mycnf).to include("mysqld_plugin" => hash_including("additional-mysqld_plugin-property" => "additional-mysqld_plugin-value"))
+    end
+    it 'adds additional provided sst properties' do
+      expect(parsed_mycnf).to include("sst" => hash_including("additional-sst-property" => "additional-sst-value"))
+    end
+    it 'adds additional provided mysqldump properties' do
+      expect(parsed_mycnf).to include("mysqldump" => hash_including("additional-mysqldump-property" => "additional-mysqldump-value"))
+    end
+    it 'adds provided properties in new config sections outside the supported set' do
+      expect(parsed_mycnf).to include("new_section")
+      expect(parsed_mycnf).to include("new_section" => hash_including("new_section-property" => "new_section-value"))
+    end
+
+  end
 end

@@ -38,9 +38,9 @@
     "OFF"
   end
 
-  if_p('innodb_flush_method') do |innodb_flush_method|
-    if innodb_flush_method != 'O_DIRECT'
-        raise "Only innodb-flush-method=O_DIRECT or unset is supported!"
+  if_p('engine_config.innodb_flush_method') do |innodb_flush_method|
+    if innodb_flush_method != 'O_DIRECT' && innodb_flush_method != 'fsync'
+        raise "Only innodb_flush_method=O_DIRECT or fsync or unset are supported!"
     end
   end
 -%>
@@ -156,6 +156,7 @@ local_infile                    = <%= bool_to_on_off(p('engine_config.local_infi
 
 <%- if p('engine_config.binlog.enabled') -%>
 log_bin                         = mysql-bin
+sync_binlog                     = <%= p('engine_config.binlog.sync') %>
 <%- else -%>
 skip-log-bin
 <%- end -%>

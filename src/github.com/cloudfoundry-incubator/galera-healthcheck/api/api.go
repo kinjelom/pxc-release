@@ -130,6 +130,7 @@ func (r router) getInsecureHandler(run RunFunc) http.Handler {
 }
 
 func (r router) v1Status() http.Handler {
+	var priorHealth bool
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		s, err := r.stateSnapshotter.State()
 		if err != nil {
@@ -140,13 +141,19 @@ func (r router) v1Status() http.Handler {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-
-		json.NewEncoder(w).Encode(V1StatusResponse{
+		currentHealth := s.IsHealthy(r.rootConfig.AvailableWhenReadOnly)
+		resp := V1StatusResponse{
 			WsrepLocalState:        uint(s.WsrepLocalState),
 			WsrepLocalStateComment: string(s.WsrepLocalState.Comment()),
 			WsrepLocalIndex:        s.WsrepLocalIndex,
-			Healthy:                s.IsHealthy(r.rootConfig.AvailableWhenReadOnly),
-		})
+			Healthy:                currentHealth,
+		}
+
+		if priorHealth != currentHealth {
+			r.logger.Info(fmt.Sprintf("health transition response: %#v maintenanceEnabled: %t readOnly: %t", resp, s.MaintenanceEnabled, s.ReadOnly))
+		}
+		priorHealth = currentHealth
+		json.NewEncoder(w).Encode(resp)
 	})
 }
 
